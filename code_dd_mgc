@@ -1,0 +1,825 @@
+---
+title: "Hertie School, GRAD-E1340: Causal Inference and Machine Learning"
+output: html_notebook
+---
+
+# Final Project: 
+## Mariana G. Carrillo, 199278
+### December 10th, 2020
+
+#### Summary
+
+In the research paper "Direct democracy and government size, evidence from Spain." Carlos Sanz examines the effect of direct democracy as a government system on the overall expenditures, revenues, and deficits in Spanish municipalities. He uses a regression discontinuity design and explores alternative mechanisms (reverse causality, confounded treatment by federal transfers, elite capture) and usual robustness checks for his estimations (covariate balance, donut regressions, and placebo tests at other population thresholds). For the analysis, he uses a dataset from 73.6% budgets of Spanish municipalities for the period 1978-2011.
+
+As alternative robustness checks, I replicate the proposed models using a different bandwidth (BW) selector. I find that the research design is sensitive to the BW method used. As an alternative causal mechanism, I discuss the possibility of time-varying factors that might generate bias in the estimations and use a difference in differences design considering a lagged variable for the treatment (direct democracy). I find that by including in the analysis more observations than those included in the bandwidths, the effect of direct democracy becomes positive, and its magnitude is smaller in absolute terms.  
+
+*Word Count -excluding tables and figures-: 1,837*
+
+***
+
+The following code is to replicate some of the tables and figures from "Direct democracy and government size, evidence from Spain" by Carlos Sanz. The second section of this work contains the code for two different identification strategies. Code developed by Mariana G. Carrillo. *Version 2. December 10th, 2020*
+
+***
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#0. Load libraries
+
+library(foreign)
+library(tidyr)
+library(kableExtra)
+library(dplyr)
+library(xtable)
+library(stargazer)
+library(lmtest)
+library(zoo)
+library(sandwich)
+library(tidyverse)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(sjstats)
+library(ggplot2)
+library(moonBook)
+library(ggiraph)
+library(ggiraphExtra)
+library(plyr)
+library(rdd)
+library(tidyverse)
+library(rdrobust)
+library(ggdag)
+library(stargazer)
+library(dummies)
+library(KernSmooth)
+library(locfit)
+library(datasets)
+library(RColorBrewer)
+library(devtools)
+#install_github("MatthieuStigler/RDDtools", subdir = "RDDtools")
+#library(RDDtools)
+library(plm)
+#if (!require("devtools"))
+  #install.packages("devtools")
+#devtools::install_github("jgabry/QMSS_package")
+#library(QMSS)
+library(plm)
+library(ggdag)
+
+```
+
+### 1. Research Question
+
+The following Directed Acyclic Graph (DAG) illustrates the relationships between variables assumed by the author, where "Out" is the Outcome of interest (being expenditures, revenues, and the deficit of a municipality), "DD" Direct Democracy as a government system that affects government's spending: "FE" represents Fixed Effects within a municipality and "u" an error term. Figure 1 reflects the same relationships modeled in Equation 1.
+
+
+> **Equation 1.**
+
+$$Outcome_{myt} = \alpha_{m} + \beta DirDem_{mt} + f(Population_{mt} -100) + u_{myt}$$
+Figure 1. DAG for the research design of Direct democracy and government size: evidence from Spain
+
+```{r}
+
+#1. DAG of research design
+#1.1 Generate coords vectors
+coords1 <- list(
+  x = c(DD = 0, Out = 0, Pop = 1, FE = .5, u = -0.5),
+  y = c(DD = 0, Out = 1, Pop = 0, FE = 2, u = 2))
+
+#1.2 Generate DAG
+Figure1 <- dagify(Out ~ DD + Pop + FE + u,
+               DD ~ Pop,
+              coords = coords1)
+ggdag(Figure1, layout = "circle") +
+  theme_dag_blank()
+
+```
+
+
+```{r}
+#1. Prepare data
+
+library(haven)
+sanz_psrm <- read_dta("C:/Users/mcarr/Downloads/sanz_psrm.dta")
+View(sanz_psrm)
+
+#1.1 Rename data
+
+dat <- sanz_psrm
+
+#1.2 Prepare data
+dat <- dat %>% drop_na(expenditures_c) #Drop observations with missing data
+
+da2 <- dat %>% drop_na(log_expenditures_c) #Drop observations with missing data
+
+dat <- dat %>% filter(year > 1987 & year <= 2011) #Drop observations out-of-sample years. 
+
+#1.2.2 Generating centered population, running variable
+dat$running = dat$population-99.5
+
+```
+
+### 2. Empirical Strategy 
+
+The author argues that a discontinuity in the density of the population sizes within the municipalities is observed at the threshold to be a candidate or not for being able to implement Direct Democracy as a government system.  This discontinuity is illustrated in Figure 1.
+
+```{r}
+#2.1 Plot histogram
+
+Figure2 <- ggplot(data=dat, aes(population)) + 
+  geom_histogram(binwidth = 5) + theme_classic() + 
+  labs(title = "Figure 2. Histogram of population sizes",
+       subtitle = "An observation is a municipality-year. Bins are 5-inhabitant wide", x = "Population", y = "Observations", caption = "Adapted from Direct democracy and government size: evidence from Spain, by C. Sanz, 2017.") + geom_vline(xintercept = 100, linetype="dotted", 
+                color = "white")
+
+Figure2
+
+```
+Another visual inspection to check whether it makes sense to use a Regression Discontinuity Design (RDD) as the one used by the author is provided in Figure 3. 
+
+```{r}
+#2.2 Plot for visual check for RD
+Figure3 <- dat %>% 
+  ggplot(aes(x = running, y = as.factor(dd), col = as.factor(dd))) + geom_point() +
+  labs(title = "Figure 3.Running variable and government system",
+       x = "Running variable (Population size, centerd around 100 inhabitants)",
+       y = "Government system") +
+  scale_colour_discrete(name="Government\nSystem",
+                          breaks=c("0", "1"), 
+                        labels=c("Representative", "Direct")) +
+  theme_classic()
+
+Figure3
+
+```
+
+```{r}
+#3.1 Generate bandwidths with IK method 
+#The command for the IK bandwidth is deprecated, so I will be using the ones specified in the paper (expenditures=27, revenues=25, Deficit=98)
+
+bw_ex <- 27
+bw_rev <- 25
+bw_def <- 98
+
+```
+
+ 
+```{r}
+#3.2 Generate robustness check BW
+
+#Bandwidth selection for Revenues
+rdbwrev_mserd <- rdbwselect(y = dat$log_revenues_c, x = dat$running, kernel = "uni",  bwselect = "mserd")
+bwrev_mserd <- rdbwrev_mserd$bws[1]
+
+#Bandwidth selection for Expenditures
+
+rdbwexp_mserd <- rdbwselect(y = dat$log_expenditures_c, x = dat$running, kernel = "uni",  bwselect = "mserd")
+bwexp_mserd <- rdbwexp_mserd$bws[1]
+
+
+#Bandwidth selection for Deficit
+rdbwdef_mserd <- rdbwselect(y = dat$deficit_c, x = dat$running, kernel = "uni",  bwselect = "mserd")
+bwedef_mserd <- rdbwdef_mserd$bws[1]
+
+```
+
+```{r}
+#3.3 Run panel data linear models (original BW)
+
+#Panel A. Log Expenditures
+
+dat$ddpop <- dat$running*dat$dd #generate interaction variable
+
+#Column 1: Linear specification, BW=27.94
+
+plm_ex <- plm(log_expenditures_c ~ running + dd + ddpop +as.factor(year), 
+               data = subset(dat, running > 0 - bw_ex & running < 0 + bw_ex), 
+               index = c("id"), model = "within")
+plm_ex.ct <- coeftest(plm_ex, vcov. = vcovHC(plm_ex, type="sss", cluster="group")) #Clustered SE
+
+
+#Column 2: Linear specification, BW=27.94*1.5
+
+bw_ex15 <- (bw_ex*1.5)
+
+plm_ex15 <- plm(log_expenditures_c ~ running + dd + ddpop +as.factor(year), 
+                 data = subset(dat, running > 0 - bw_ex15 & running < 0 + bw_ex15), 
+                 index = c("id"), model = "within")
+plm_ex15.ct <- coeftest(plm_ex15, vcov. = vcovHC(plm_ex15, type="sss", cluster="group"))
+
+#Column 3: Linear specification, BW=27.94*.5
+bw_ex5 <- (bw_ex*.5)
+
+
+plm_ex5 <- plm(log_expenditures_c ~ running + dd + ddpop + as.factor(year), 
+                data = subset(dat, running > 0 - bw_ex5 & running < 0 + bw_ex5), 
+                index = c("id"), model = "within")
+plm_ex5.ct <- coeftest(plm_ex5, vcov. = vcovHC(plm_ex5, type="sss", cluster="group"))
+
+#Column 4: Polynomial specification, full
+
+plm_ex3 <- plm(log_expenditures_c ~ dd + poly(running, 3, raw = T) +
+                 poly(running, 3, raw = T)*dd, 
+                data = dat, 
+                index = c("id", "year"), model = "within",
+               effect = "twoways")
+plm_ex3.ct <- coeftest(plm_ex3, vcov. = vcovHC(plm_ex3, type="sss", cluster="group"))
+
+#***********************************************************************
+
+#Panel B. Log Revenues
+#Column 1: Linear specification, BW=25.42
+
+plm_rev <- plm(log_revenues_c ~ running + dd + ddpop +as.factor(year), 
+                data = subset(dat, running > 0 - bw_rev & running < 0 + bw_rev), 
+                index = c("id"), model = "within")
+plm_rev.ct <- coeftest(plm_rev, vcov. = vcovHC(plm_rev, type="sss", cluster="group"))
+
+#Column 2: Linear specification, BW=25.42*1.5
+
+bw_rev15 <- (bw_rev*1.5)
+
+
+plm_rev15 <- plm(log_revenues_c ~ running + dd + ddpop +as.factor(year), 
+                  data = subset(dat, running > 0 - bw_rev15 & running < 0 + bw_rev15), 
+                  index = c("id"), model = "within")
+plm_rev15.ct <- coeftest(plm_rev15, vcov. = vcovHC(plm_rev15, type="sss", cluster="group"))
+
+#Column 3: Linear specification, BW=25.42*.5
+bw_rev5 <- (bw_rev*.5)
+
+
+plm_rev5 <- plm(log_revenues_c ~ running + dd + ddpop +as.factor(year), 
+                 data = subset(dat, running > 0 - bw_rev5 & running < 0 + bw_rev5), 
+                 index = c("id"), model = "within")
+plm_rev5.ct <- coeftest(plm_rev5, vcov. = vcovHC(plm_rev5, type="sss", cluster="group"))
+
+#Column 4: Polynomial specification, full
+
+plm_rev3 <- plm(log_revenues_c ~ dd + poly(running, 3, raw = T) +
+                 poly(running, 3, raw = T)*dd, 
+                data = dat, 
+                index = c("id", "year"), model = "within",
+               effect = "twoways")
+plm_rev3.ct <- coeftest(plm_rev3, vcov. = vcovHC(plm_rev3, type="sss", cluster="group"))
+
+#*************************************************************************
+
+#Panel C. Deficit (euros)
+#Column 1: Linear specification, BW=98.60
+
+plm_defm <- plm(deficit_c ~ running + dd + ddpop +as.factor(year), 
+               data = subset(dat, running > 0 - bw_def & running < 0 + bw_def), 
+               index = c("id"), model = "within")
+plm_defm.ct <- coeftest(plm_defm, vcov. = vcovHC(plm_defm, type="sss", cluster="group"))
+
+#Column 2: Linear specification, BW=98.60*1.5
+
+bw_def15 <- (bw_def*1.5)
+
+plm_defm15 <- plm(deficit_c ~ running + dd + ddpop +as.factor(year), 
+                data = subset(dat, running > 0 - bw_def15 & running < 0 + bw_def15), 
+                index = c("id"), model = "within")
+plm_defm15.ct <- coeftest(plm_defm15, vcov. = vcovHC(plm_defm15, type="sss", cluster="group"))
+
+#Column 3: Linear specification, BW=98.60*.5
+
+bw_def5 <- (bw_def*.5)
+
+plm_defm5 <- plm(deficit_c ~ running + dd + ddpop +as.factor(year), 
+                  data = subset(dat, running > 0 - bw_def5 & running < 0 + bw_def5), 
+                  index = c("id"), model = "within")
+plm_defm5.ct <- coeftest(plm_defm5, vcov. = vcovHC(plm_defm5, type="sss", cluster="group"))
+
+#Column 4: Polynomial specification, full
+plm_def3 <- plm(deficit_c ~ dd + poly(running, 3, raw = T) +
+                 poly(running, 3, raw = T)*dd, 
+                data = dat, 
+                index = c("id", "year"), model = "within",
+               effect = "twoways")
+plm_def3.ct <- coeftest(plm_def3, vcov. = vcovHC(plm_def3, type="sss", cluster="group"))
+
+```
+
+```{r}
+#3.4 Prepare data for table 1
+
+#3.4.1Extract Coefficients
+
+#Panel A. Expenditures
+plmA <- round(plm_ex$coefficients[2], digits = 4)
+plmA15 <- round(plm_ex15$coefficients[2], digits = 4)
+plmA5 <- round(plm_ex5$coefficients[2], digits = 4)
+plmA3 <- round(plm_ex3$coefficients[1], digits = 4)
+
+#Panel B. Revenues
+plmB <- round(plm_rev$coefficients[2], digits = 4)
+plmB15 <-round(plm_rev15$coefficients[2], digits = 4)
+plmB5 <-round(plm_rev5$coefficients[2], digits = 4)
+plmB3 <-round(plm_rev3$coefficients[1], digits = 4)
+
+#Panel C. Deficit
+plmC <-round(plm_defm$coefficients[2], digits = 3)
+plmC15 <-round(plm_defm15$coefficients[2], digits = 3)
+plmC5 <-round(plm_defm5$coefficients[2], digits = 3)
+plmC3 <-round(plm_def3$coefficients[1], digits = 3)
+
+#3.4.2 Extract clustered standard errors
+
+#Panel A. Expenditures
+plmASE <-round(plm_ex.ct[2,2], digits = 4)
+plmA15SE <-round(plm_ex15.ct[2,2], digits = 4)
+plmA5SE <-round(plm_ex5.ct[2,2], digits = 4)
+plmA3SE <-round(plm_ex3.ct[1,2], digits = 4)
+
+
+#Panel B. Revenues
+plmBSE <-round(plm_rev.ct[2,2], digits = 4)
+plmB15SE <-round(plm_rev15.ct[2,2], digits = 4)
+plmB5SE <-round(plm_rev5.ct[2,2], digits = 4)
+plmB3SE <-round(plm_rev3.ct[1,2], digits = 4)
+
+#Panel C. Deficit
+plmCSE <-round(plm_defm.ct[2,2], digits = 3)
+plmC15SE <-round(plm_defm15.ct[2,2], digits = 3)
+plmC5SE <-round(plm_defm5.ct[2,2], digits = 3)
+plmC3SE <-round(plm_def3.ct[1,2], digits = 3)
+
+
+#3.4.3 Extract number of observations
+
+plm_An <- nobs(plm_ex)
+plm_A15n <- nobs(plm_ex15)
+plm_A5n <- nobs(plm_ex5)
+plm_A3n <- nobs(plm_ex3)
+
+plm_Bn <- nobs(plm_rev)
+plm_B15n <- nobs(plm_rev15)
+plm_B5n <- nobs(plm_rev5)
+plm_B3n <- nobs(plm_rev3)
+
+plm_Cn <- nobs(plm_defm)
+plm_C15n <- nobs(plm_defm15)
+plm_C5n <- nobs(plm_defm5)
+plm_C3n <- nobs(plm_def3)
+```
+
+### 3. Main Results
+
+Sanz examines the effect of direct democracy on public finances in Spanish municipalities by studying three different variables: Expenditures (log), Revenues (log) and Deficit (eur). He uses seven different panel specifications for *Equation 1* and I replicate the estimates of the first four columns of Table 2 (Sanz's paper) for the three panels. In all regressions, fixed time and unit-specific effects are included. Each column of Table 1 reports the estimated coefficients, standard errors (clustered at municipality level), number of observations, type of specification and bandwidth used for the linear model for panel data.  Unfortunately, the commands to estimate an optimal bandwidth for each panel as proposed by Imbens and Kalyanaraman (2012) using a rectangular kernel are deprecated, so I will the Optimal Bandwidths (BW) as given from the original paper. As a first robustness check, I will select the Optimal BW through the method of one common Mean Square Error for the RD treatment effect estimator, as suggested by Calonico, Cattaneo and Titiunik (2014).
+
+The main findings (Table 1) show that direct democracy has a statistically significant effect on finances by decreasing the size of government measured as the total log expenditures and log revenues. The effect of direct democracy has no significant effect on the overall deficits of municipalities. Contrasting these estimations with the ones from the original paper, it is challenging to understand why using the same bandwidths as suggested in the author's paper do not yield the same estimators. The core difference is in the sample size used to perform the estimations, and this suggests high sensitivity of this research design to the sample size and to the BW selection (because the original BW were rounded to the closest value to avoid decimals). I can say that there is where the discrepancy relies upon because, for the estimation of the cubic model with no bandwidth, there is no difference.  
+
+#### Table 1. Effect of Direct Democracy on Public Finances (Original Bandwidths, IK Method)
+```{r}
+
+#3.5 Generate table 1
+table1 <- matrix(c(plmA,plmA15,plmA5,plmA3,
+                   plmASE,plmA15SE,plmA5SE,plmA3SE ,
+                   plm_An,plm_A15n,plm_A5n,plm_A3n,
+                   "Linear", "Linear", "Linear", "Order 3",
+                   "Optimal a", "Optimal a x 1.5", "Optimal a x 0.5", "Full",
+                  plmB,plmB15,plmB5,plmB3,
+                  plmBSE,plmB15SE,plmB5SE,plmB3SE ,
+                  plm_Bn,plm_B15n,plm_B5n,plm_B3n,
+                  "Linear", "Linear", "Linear", "Order 3",
+                  "Optimal b", "Optimal b x 1.5", "Optimal b x 0.5", "Full",
+                  plmC,plmC15,plmC5,plmC3,
+                  plmCSE,plmC15SE,plmC5SE,plmC3SE ,
+                  plm_Cn,plm_C15n,plm_C5n,plm_C3n,
+                  "Linear", "Linear", "Linear", "Order 3",
+                  "Optimal c", "Optimal c x 1.5", "Optimal c x 0.5", "Full"),ncol=4,byrow=TRUE)
+
+colnames(table1) <- c("( 1 )","( 2 )","( 3 )","( 4 )")
+rownames(table1) <- c("Direct Democracy","SE","Observations", "Specification", "Bandwidth",
+                     "Direct Democracy","SE","Observations", "Specification", "Bandwidth",
+                     "Direct Democracy","SE","Observations", "Specification", "Bandwidth")
+table1 <- as.table(table1)
+
+
+#3.6 Format table 1
+
+kable(table1) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", position = "float_center")) %>%
+  footnote(general = "Colums 1-4 report estimated coefficients for Equation (1) for all panels with a uniform kernel including time and unit fixed effects. This table was adapted from Direct democracy and government size: evidence from Spain, by C. Sanz, 2017.",
+           number = c("Optimal BW a = 27, Optimal BW b = 25, Optimal BW c = 98", 
+                      "Standar Errors, clustered at municipality level.", 
+                      "Discrepancies in Standar Errors and number of observations might be due to the decimal points difference between the bandwidths used in the paper and the ones I used to make the estimations."))%>%
+  pack_rows("Panel A. Log Expenditures", 1, 5, label_row_css = "background-color: #666; color: #fff;")  %>%
+  pack_rows("Panel B. Log Revenues", 6, 10, label_row_css = "background-color: #666; color: #fff;")  %>%
+  pack_rows("Panel C. Deficit (euros)", 11, 15, label_row_css = "background-color: #666; color: #fff;") 
+
+```
+
+```{r}
+#3.3.1 Run Robustness Check 
+
+#Panel A. Log Expenditures
+
+#Column 1: Linear specification, BW=13.1895
+rob_plm_ex <- plm(log_expenditures_c ~ running + dd + ddpop +as.factor(year), 
+               data = subset(dat, running > 0 - bwexp_mserd  & running < 0 + bwexp_mserd), 
+               index = c("id"), model = "within") #Expenditures BW
+rob_plm_ex.ct <- coeftest(rob_plm_ex, vcov. = vcovHC(rob_plm_ex, type="sss", cluster="group")) #Clustered SE
+
+
+#Column 2: Linear specification, BW=13.1895*1.5
+
+bwexp_mserd15 <- (bwexp_mserd*1.5)
+
+rob_plm_ex15 <- plm(log_expenditures_c ~ running + dd + ddpop +as.factor(year), 
+                 data = subset(dat, running > 0 - bwexp_mserd15 & running < 0 + bwexp_mserd15), 
+                 index = c("id"), model = "within")
+rob_plm_ex15.ct <- coeftest(rob_plm_ex15, vcov. = vcovHC(rob_plm_ex15, type="sss", cluster="group"))
+
+#Column 3: Linear specification, BW=13.1895*.5
+
+bwexp_mserd5 <- (bwexp_mserd*.5)
+
+
+rob_plm_ex5 <- plm(log_expenditures_c ~ running + dd + ddpop + as.factor(year), 
+                data = subset(dat, running > 0 - bwexp_mserd5 & running < 0 + bwexp_mserd), 
+                index = c("id"), model = "within")
+rob_plm_ex5.ct <- coeftest(rob_plm_ex5, vcov. = vcovHC(rob_plm_ex5, type="sss", cluster="group"))
+
+#Column 4: Polynomial specification, full sample
+
+rob_plm_ex3 <- plm(log_expenditures_c ~ dd + poly(running, 3, raw = T) +
+                 poly(running, 3, raw = T)*dd, 
+                data = dat, 
+                index = c("id", "year"), model = "within",
+               effect = "twoways")
+rob_plm_ex3.ct <- coeftest(rob_plm_ex3, vcov. = vcovHC(rob_plm_ex3, type="sss", cluster="group"))
+
+#***********************************************************************
+
+#Panel B. Log Revenues
+
+#Column 1: Linear specification, BW=12.56814
+
+rob_plm_rev <- plm(log_revenues_c ~ running + dd + ddpop +as.factor(year), 
+                data = subset(dat, running > 0 - bwrev_mserd & running < 0 + bwrev_mserd), 
+                index = c("id"), model = "within")
+rob_plm_rev.ct <- coeftest(rob_plm_rev, vcov. = vcovHC(rob_plm_rev, type="sss", cluster="group"))
+
+#Column 2: Linear specification, BW=12.56814*1.5
+
+bwrev_mserd15 <- (bwrev_mserd*1.5)
+
+
+rob_plm_rev15 <- plm(log_revenues_c ~ running + dd + ddpop +as.factor(year), 
+                  data = subset(dat, running > 0 - bwrev_mserd15 & running < 0 + bwrev_mserd15), 
+                  index = c("id"), model = "within")
+rob_plm_rev15.ct <- coeftest(rob_plm_rev15, vcov. = vcovHC(rob_plm_rev15, type="sss", cluster="group"))
+
+#Column 3: Linear specification, BW=12.568142*.5
+bwrev_mserd5 <- (bwrev_mserd*.5)
+
+
+rob_plm_rev5 <- plm(log_revenues_c ~ running + dd + ddpop +as.factor(year), 
+                 data = subset(dat, running > 0 - bwrev_mserd5 & running < 0 + bwrev_mserd5), 
+                 index = c("id"), model = "within")
+rob_plm_rev5.ct <- coeftest(rob_plm_rev5, vcov. = vcovHC(rob_plm_rev5, type="sss", cluster="group"))
+
+#Column 4: Polynomial specification, full
+
+rob_plm_rev3 <- plm(log_revenues_c ~ dd + poly(running, 3, raw = T) +
+                 poly(running, 3, raw = T)*dd, 
+                data = dat, 
+                index = c("id", "year"), model = "within",
+               effect = "twoways")
+rob_plm_rev3.ct <- coeftest(rob_plm_rev3, vcov. = vcovHC(rob_plm_rev3, type="sss", cluster="group"))
+
+
+#**********************************************************************
+#Panel C. Deficit (euros)
+#Column 1: Linear specification, BW=17.40376
+
+rob_plm_defm  <- plm(deficit_c ~ running + dd + ddpop +as.factor(year), 
+               data = subset(dat, running > 0 - bwedef_mserd & running < 0 + bwedef_mserd), 
+               index = c("id"), model = "within")
+rob_plm_defm.ct <- coeftest(rob_plm_defm , vcov. = vcovHC(rob_plm_defm , type="sss", cluster="group"))
+
+#Column 2: Linear specification, BW=17.40376*1.5
+
+bwedef_mserd15 <- (bwedef_mserd*1.5)
+
+rob_plm_defm15 <- plm(deficit_c ~ running + dd + ddpop +as.factor(year), 
+                data = subset(dat, running > 0 - bwedef_mserd15 & running < 0 + bwedef_mserd15), 
+                index = c("id"), model = "within")
+rob_plm_defm15.ct <- coeftest(rob_plm_defm15, vcov. = vcovHC(rob_plm_defm15, type="sss", cluster="group"))
+
+#Column 3: Linear specification, BW=17.40376*.5
+
+bwedef_mserd5 <- (bwedef_mserd*.5)
+
+rob_plm_defm5 <- plm(deficit_c ~ running + dd + ddpop +as.factor(year), 
+                  data = subset(dat, running > 0 - bwedef_mserd5 & running < 0 + bwedef_mserd5), 
+                  index = c("id"), model = "within")
+rob_plm_defm5.ct <- coeftest(rob_plm_defm5, vcov. = vcovHC(rob_plm_defm5, type="sss", cluster="group"))
+
+#Column 4: Polynomial specification, full
+rob_plm_def3 <- plm(deficit_c ~ dd + poly(running, 3, raw = T) +
+                 poly(running, 3, raw = T)*dd, 
+                data = dat, 
+                index = c("id", "year"), model = "within",
+               effect = "twoways")
+rob_plm_def3.ct <- coeftest(rob_plm_def3, vcov. = vcovHC(rob_plm_def3, type="sss", cluster="group"))
+
+```
+
+```{r}
+#3.7 Prepare data for table 2
+
+#3.7.1 Extract Coefficients
+
+#Panel A. Expenditures
+rob_plmA <- round(rob_plm_ex$coefficients[2], digits = 4)
+rob_plmA15 <- round(rob_plm_ex15$coefficients[2], digits = 4)
+rob_plmA5 <- round(rob_plm_ex5$coefficients[2], digits = 4)
+rob_plmA3 <- round(rob_plm_ex3$coefficients[1], digits = 4)
+
+#Panel B. Revenues
+rob_plmB <- round(rob_plm_rev$coefficients[2], digits = 4)
+rob_plmB15 <-round(rob_plm_rev15$coefficients[2], digits = 4)
+rob_plmB5 <-round(rob_plm_rev5$coefficients[2], digits = 4)
+rob_plmB3 <-round(rob_plm_rev3$coefficients[1], digits = 4)
+
+#Panel C. Deficit
+rob_plmC <-round(rob_plm_defm$coefficients[2], digits = 3)
+rob_plmC15 <-round(rob_plm_defm15$coefficients[2], digits = 3)
+rob_plmC5 <-round(rob_plm_defm5$coefficients[2], digits = 3)
+rob_plmC3 <-round(rob_plm_def3$coefficients[1], digits = 3)
+
+#3.4.2 Extract clustered standard errors
+
+#Panel A. Expenditures
+rob_plmASE <-round(rob_plm_ex.ct[2,2], digits = 4)
+rob_plmA15SE <-round(rob_plm_ex15.ct[2,2], digits = 4)
+rob_plmA5SE <-round(rob_plm_ex5.ct[2,2], digits = 4)
+rob_plmA3SE <-round(rob_plm_ex3.ct[1,2], digits = 4)
+
+
+#Panel B. Revenues
+rob_plmBSE <-round(rob_plm_rev.ct[2,2], digits = 4)
+rob_plmB15SE <-round(rob_plm_rev15.ct[2,2], digits = 4)
+rob_plmB5SE <-round(rob_plm_rev5.ct[2,2], digits = 4)
+rob_plmB3SE <-round(rob_plm_rev3.ct[1,2], digits = 4)
+
+#Panel C. Deficit
+rob_plmCSE <-round(rob_plm_defm.ct[2,2], digits = 3)
+rob_plmC15SE <-round(rob_plm_defm15.ct[2,2], digits = 3)
+rob_plmC5SE <-round(rob_plm_defm5.ct[2,2], digits = 3)
+rob_plmC3SE <-round(rob_plm_def3.ct[1,2], digits = 3)
+
+
+#3.4.3 Extract number of observations
+
+rob_plm_An <- nobs(rob_plm_ex)
+rob_plm_A15n <- nobs(rob_plm_ex15)
+rob_plm_A5n <- nobs(rob_plm_ex5)
+rob_plm_A3n <- nobs(rob_plm_ex3)
+
+rob_plm_Bn <- nobs(rob_plm_rev)
+rob_plm_B15n <- nobs(rob_plm_rev15)
+rob_plm_B5n <- nobs(rob_plm_rev5)
+rob_plm_B3n <- nobs(rob_plm_rev3)
+
+rob_plm_Cn <- nobs(rob_plm_defm)
+rob_plm_C15n <- nobs(rob_plm_defm15)
+rob_plm_C5n <- nobs(rob_plm_defm5)
+rob_plm_C3n <- nobs(rob_plm_def3)
+```
+
+#### 3.1 First Robustness check: MSERD BW
+
+Moreover, taking into account the several data-driven ways of selecting the weighting scheme and BW size, Sanz uses Imbens' & Kalyanaraman's (2012) approach that minimizes the approximate mean squared error at the threshold. As discussed in De la Cuesta et al. (2016), this approach has been improved by Calonico et al. (2014). Constructing a bias-corrected estimator with robust confidence intervals, we observe in Table 2 that the research design is extremely sensitive to the BW selection. Despite that, the direction of the effect remains negative for all statistically significant estimations, the magnitude of the coefficients variates significantly, and in some cases, we observe they lose statistical significance. This can lead to wrong inferences of the effect of direct democracy on public finances. 
+
+In the original table of the main results, the effect is significantly larger for both panels, A and B with a higher-order polynomial specification (Column 6, Order 5). Further research is suggested to examine if the identification assumptions hold and if the discontinuity relationship is not mistaken by a non-linear relationship. 
+
+#### Table 2. Effect of Direct Democracy on Public Finances (Different Bandwidths, MSE-optimal bandwidth selector for the RD treatment effect estimator)
+```{r}
+
+#3.5 Generate table 2 -  robustness check: MSERD BW
+table2 <- matrix(c(rob_plmA,rob_plmA15,rob_plmA5,rob_plmA3,
+                   rob_plmASE,rob_plmA15SE,rob_plmA5SE,rob_plmA3SE ,
+                   rob_plm_An,rob_plm_A15n,rob_plm_A5n,rob_plm_A3n,
+                   "Linear", "Linear", "Linear", "Order 3",
+                   "Optimal d", "Optimal d x 1.5", "Optimal d x 0.5", "Full",
+                  rob_plmB,rob_plmB15,rob_plmB5,rob_plmB3,
+                  rob_plmBSE,rob_plmB15SE,rob_plmB5SE,rob_plmB3SE ,
+                  rob_plm_Bn,rob_plm_B15n,rob_plm_B5n,rob_plm_B3n,
+                  "Linear", "Linear", "Linear", "Order 3",
+                  "Optimal e", "Optimal e x 1.5", "Optimal e x 0.5", "Full",
+                  rob_plmC,rob_plmC15,rob_plmC5,rob_plmC3,
+                  rob_plmCSE,rob_plmC15SE,rob_plmC5SE,rob_plmC3SE ,
+                  rob_plm_Cn,rob_plm_C15n,rob_plm_C5n,rob_plm_C3n,
+                  "Linear", "Linear", "Linear", "Order 3",
+                  "Optimal f", "Optimal f x 1.5", "Optimal f x 0.5", "Full"),ncol=4,byrow=TRUE)
+
+colnames(table2) <- c("( 1 )","( 2 )","( 3 )","( 4 )")
+rownames(table2) <- c("Direct Democracy","SE","Observations", "Specification", "Bandwidth",
+                     "Direct Democracy","SE","Observations", "Specification", "Bandwidth",
+                     "Direct Democracy","SE","Observations", "Specification", "Bandwidth")
+table2 <- as.table(table2)
+
+
+#3.6 Format table 1
+
+kable(table2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", position = "float_center")) %>%
+  footnote(general = "Colums 1-4 report estimated coefficients for Equation (1) for all panels with a uniform kernel including time and unit fixed effects.",
+           number = c("Optimal BW d = 13.1895, Optimal BW e = 12.5681, Optimal BW f = 17.4037", 
+                      "Standar Errors, clustered at municipality level.",
+                      "BW estimated through MSE-optimal bandwidth selector for the RD treatment effect estimator"))%>%
+  pack_rows("Panel A. Log Expenditures", 1, 5, label_row_css = "background-color: #666; color: #fff;")  %>%
+  pack_rows("Panel B. Log Revenues", 6, 10, label_row_css = "background-color: #666; color: #fff;")  %>%
+  pack_rows("Panel C. Deficit (euros)", 11, 15, label_row_css = "background-color: #666; color: #fff;") 
+
+```
+
+***
+In Figure 3 of his paper, the autor estimates  $$ Outcome_{myt} = \alpha_{m} + \gamma_{y}+ \sum_{100-OBW}^{100+OBW} \delta_{j}Population_{j, mt} + u_{myt}$$ where Population ~j, mt~ is a dummy variable that indicates if municipality m has population size ~j~ at term ~t~. In the y axis, estimated coefficients $delta_{j}$. 
+
+I use several data-driven RD plots that are evenly-spaced with binned sample means tracing out the underlying regression discontinuity function (Equation 1) using a rectangular kernel. The variables are not standardized and in the following Figure I plot the running variable against the outcome of interest, which might explain the difference from the original Figure 3  from Sanz's paper 
+
+#### Figure 4. Effect of direct democracy on expenditures, revenues, and deficit. 
+```{r}
+
+#3.7 RD Plot regressions
+
+#RD Plot for log expenditures
+rdplot(y = dat$log_expenditures_c, x = dat$running, title = "Figure 3. RD Plot - Effect of direct democracy on Expenditures",
+       y.label = "Log Expenditures (EUR)",
+       x.label = "Running Variable", col.dots = "#999999", col.lines = "black")
+
+#RD Plot for log Revenues
+rdplot(y = dat$log_revenues_c, x = dat$running, title = "Figure 4. RD Plot - Effect of direct democracy on Revenues",
+       y.label = "Log Revenues (EUR)",
+       x.label = "Running Variable", col.dots = "#999999", col.lines = "black" )
+
+#RD Plot for Deficit
+rdplot(y = dat$deficit_c, x = dat$running, title = "Figure 5. RD Plot - Effect of direct democracy on Deficit",
+       y.label = "Deficit",
+       x.label = "Running Variable", col.dots = "#999999", col.lines = "black")
+```
+
+
+### 4. Discussion
+
+#### 4.1 Modeling Strategy
+
+*Assumptions*
+
+The main identification assumption of the research paper is that there are no other variables that confound the effect of direct democracy on the outcome of interest -holding municipality and year fixed effects-.  
+
+*Strenghts*
+
+The strengths identified in the empirical strategy are the several robustness checks that are run by the author and included in the appendix that support the research high internal validity. Also, the effect of direct democracy remains statistically significant throughout all the seven different specifications presented in the paper, which suggests that the design is not sensible to the form of the function selected to estimate such effect. The latter confirms the high internal validity of the study. 
+
+*Limitations*
+
+The research design relies strongly on the identification assumption and, even though the author carries out several robustness checks, the empirical strategy is population threshold dependent. This means that there can also be confounding and sorting. Moreover, as I showed in the first robustness check, the magnitude of  the estimations are highly sensitive to the BW selection method. 
+
+I argue that several factors are not considered in the research and that these might confound or generate bias in the estimation of the effect of direct democracy on the outcomes of interest. One of the main trends that have been present during the last three decades in Spain is the increasing depopulation of rural areas (i.e. municipalities under 100 inhabitants). Moreover, it could be also true that the demographic composition of the localities that are eligible for this type of government directly affects the outcome of interest given that on average, over 60% of their population is over 65 and without any inhabitants younger than 20. In the online appendix, the discussion related to demographic variables that might influence the estimations does not consider this. 
+
+However, considering that the sizes of the municipalities are approximately randomized at the exogenously assigned population thresholds, the use of a regression discontinuity design seems appropriate for the research and might ease the concerns regarding the other factors I proposed at the beginning of this section. The latter would back the findings of this research paper for they are consistent with other research studies in Switzerland, the US, and New England (See  Besley et al. & Feld et al. 2003). Nonetheless, it is worth mentioning that the extrapolation of RD estimates away from the threshold sacrifices the design's advantage in internal validity (see de la Cuesta et. al 2016), which is why I present an alternative specification of the model in section 5.
+
+#### 4.2 Second Robustness check: Regression discontinuity
+
+As a second robustness check, I conduct a regression discontinuity design method to account for observed covariates in the RD original design aiming to increase the precision of treatment effect estimation. I argue that having direct democracy as a government system in the period t-1 also affects public finances. In table 2, I report the estimated coefficients and use the Optimal bandwidth that Sanz uses for figure 3 in his paper (Equation 2).
+
+**Equation 2.**   
+
+$$Outcome_{myt} = \alpha_{m} + \beta_{1} DirDem_{mt}+ \beta_{2} DirDem_{m t-1} + f(Population_{mt} -100) + u_{myt}$$
+
+Direct democracy remains a statistically significant factor affecting both, expenditures and revenues in Spanish municipalities. However, it is also observed that the lagged treatment variable does not affect the outcome of interest. These results are similar and consistent to the ones presented in the original paper and further contribute to the discussion of whether the effect of direct democracy on public finances increases over time.
+
+#### Table 2. Effect of Direct Democracy on Public Finances adjusted by having DD as a government system 
+```{r, results = "asis"}
+
+#4.1 Run panel data linear models 
+
+#Panel A
+plm_ex2 <- plm(log_expenditures_c ~ running*dd + l_dd, 
+               data = subset(dat, running > 0 - bw_ex & running < 0 + bw_ex), 
+               index = c("id", "year"), model = "within", effect = "twoways")
+plm_ex2.ct <- coeftest(plm_ex2, vcov. = vcovHC(plm_ex2, type="sss", cluster="group")) #Cluster SE
+
+#Panel B
+plm_rev2 <- plm(log_revenues_c ~ running*dd + l_dd, 
+               data = subset(dat, running > 0 - bw_rev & running < 0 + bw_rev), 
+               index = c("id", "year"), model = "within", effect = "twoways")
+plm_rev2.ct <- coeftest(plm_rev2, vcov. = vcovHC(plm_rev2, type="sss", cluster="group"))
+
+#Panel C
+plm_def2 <- plm(deficit_c ~ running*dd + l_dd, 
+                data = subset(dat, running > 0 - bw_def & running < 0 + bw_def), 
+                index = c("id", "year"), model = "within", effect = "twoways")
+plm_def2.ct <- coeftest(plm_def2, vcov. = vcovHC(plm_def2, type="sss", cluster="group"))
+
+#4.2 Extract data for table 2
+
+#Coefficients DD
+plmA2 <- round(plm_ex2$coefficients[2], digits = 4)
+plmB2 <- round(plm_rev2$coefficients[2], digits = 4)
+plmC2 <-round(plm_def2$coefficients[2], digits = 3)
+
+#Coeff lagged DD
+plmA2.l <- round(plm_ex2$coefficients[3], digits = 4)
+plmB2.l <- round(plm_rev2$coefficients[3], digits = 4)
+plmC2.l <-round(plm_def2$coefficients[3], digits = 3)
+
+
+#SELagged DD
+plmASE2.l <-round(plm_ex2.ct[3,2], digits = 4)
+plmBSE2.l <-round(plm_rev2.ct[3,2], digits = 4)
+plmCSE2.l <-round(plm_def2.ct[3,2], digits = 3)
+
+#SE DD
+plmASE2 <-round(plm_ex2.ct[2,2], digits = 4)
+plmBSE2 <-round(plm_rev2.ct[2,2], digits = 4)
+plmCSE2 <-round(plm_def2.ct[2,2], digits = 3)
+
+#Number of observations
+plm_A2n <- nobs(plm_ex2)
+plm_B2n <- nobs(plm_rev2)
+plm_C2n <- nobs(plm_def2)
+
+
+#4.3 Create table 2
+table2 <- matrix(c(plmA2,plmB2,plmC2,
+                   plmASE2,plmBSE2,plmCSE2,
+                   plmA2.l,plmB2.l,plmC2.l,
+                   plmASE2.l,plmBSE2.l,plmCSE2.l,
+                   plm_A2n,plm_B2n,plm_C2n,
+                   "Linear", "Linear", "Linear",
+                   "Optimal a", "Optimal a", "Optimal a"),ncol=3,byrow=TRUE)
+
+colnames(table2) <- c("Log Expenditures","Log Revenues","Deficit (euros)")
+rownames(table2) <- c("Direct Democracy","SE","Direct Democracy t-1","SE","Observations", "Specification", "Bandwidth")
+table2 <- as.table(table2)
+
+
+##4.4 Format table 2
+kable(table2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", position = "center")) %>%
+  footnote(general = "Colums 1-3 report estimated coefficients for Equation (2) for all panels with a uniform kernel including time and unit fixed effects. Optimal bandwidth calculated as suggested as in Imbens und Kalyanaraman 2012, using same bandwidth (Optimal a) for all three models, as Sanz's uses it in Figure 3 in the original paper.", 
+                      "Standar Errors are presented as clustered at municipality level.") %>%
+  add_header_above(c(" " = 1, "Panel A" = 1, "Panel B" = 1, "Panel C" = 1))
+
+```
+
+
+### 5. Alternative Identification Strategy 
+
+I propose a Difference in Differences model that takes into account the pre-treatment levels of the outcome of interest. I include a lagged variable of the treatment variable (direct democracy) as a regressor in the three panels as suggested in Wing et al. 2018. The coefficients substantially differ from those of the estimated with the RD design. The sign of the effect is positive in contrast to the estimations shown in the paper (yet, they remain statistically significant). 
+
+The latter suggests that indeed, direct democracy might be a factor that has an effect on public finances but it might change as a function of the population and of time increasing the size of the government.The explanatory power of the model is considerably lower than the one from the original design. This might be due to the observations used for the analysis. In the DiD estimation, even though there are observations dropped, over 95% of the observations are considered.
+
+Another reason that might explain the discrepancies between results might be because by including the  lagged treatment variable in the DID model we include Time-Varying Treatment Effects that the original Panel model does not capture and this might also imply that the treatment effect could be heterogeneous among units. It is also worth noticing that we observe a statistically significant effect for the interaction of direct democracy in *t* and *t-1* for the municipalities' deficit. This might represent a hint of interest for further research on how direct democracy affects fiscal discipline over time.  Furthermore, it would also be interesting to try to collect data on the coalitions in the government and include them in the analysis to examine its relation to fiscal discipline.
+
+```{r, warning = FALSE, results = "asis"}
+
+#5.1 Generate variables representing the change in outcome of interest
+dat <- dat %>% 
+  mutate(change_logex = log_expenditures_c - l_log_expenditures_c,
+         change_logrev = log_revenues_c - l_log_revenues_c,
+         change_def = deficit_c - l_deficit_c)
+
+#5.2 Generate model diff in diff
+
+did_A1 <- lm(log_expenditures_c ~ dd*l_dd, data = dat) #Panel A
+
+did_B1 <- lm(log_revenues_c ~ dd*l_dd, data = dat) #Panel B
+
+did_C1 <- lm(deficit_c ~ dd*l_dd, data = dat) #Panel C
+
+stargazer(did_A1, did_B1, did_C1,type = 'html',digits = 3,
+          title            = "Difference in Difference estimates for three panels",
+          covariate.labels = c("Direct democracy", "Direct democracy t-1", "Interaction", "Constant"),
+          dep.var.caption  = "Table 3. Difference in difference estimations of the effect of direct democracy on public finances",
+          dep.var.labels   = c("Log Expenditures", "Log Revenues", "Deficit"))
+```
+
+
+
+***
+
+### References
+
+Abraham, S., & Sun, L. (2018). Estimating Dynamic Treatment Effects in Event Studies With Heterogeneous Treatment Effects. SSRN Electronic Journal. doi: 10.2139/ssrn.3158747
+
+Besley, T. and A. Case (2003). Political institutions and policy choices: Evidence from the United States. Journal of Economic Literature 41 (1), 7-73
+
+Calonico, S., M. D. Cattaneo, and R. Titiunik. 2014. Robust Data-Driven Inference in the Regression-Discontinuity Design. Stata Journal 14(4): 909-946.
+
+De la Cuesta, B., & Imai, K. (2016). Misunderstandings About the Regression Discontinuity Design in the Study of Close Elections. Annual Review Of Political Science, 19(1), 375-396. doi: 10.1146/annurev-polisci-032015-010115
+
+Feld, L. P. and J. G. Matsusaka (2003). Budget referendums and government spending: evidence from the Swiss cantons. Journal of Public Economics 87 (12), 2703-2724
+
+Froelich, M., & Huber, M. (2018). Including Covariates in the Regression Discontinuity Design. Journal Of Business & Economic Statistics, 37(4), 736-748. doi: 10.1080/07350015.2017.1421544
+
+Hlavac, Marek (2018). stargazer: Well-Formatted Regression and Summary Statistics Tables. R package version 5.2.1.
+
+Sanz, C. (2019). Direct democracy and government size: evidence from Spain. Political Science Research And Methods, 1-16. doi: 10.1017/psrm.2018.65
+
+Wing, C., Simon, K., & Bello-Gomez, R. (2018). Designing Difference in Difference Studies: Best Practices for Public Health Policy Research. Annual Review Of Public Health, 39(1), 453-469. doi: 10.1146/annurev-publhealth-040617-013507
+

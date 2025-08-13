@@ -1,6 +1,7 @@
 ---
-title: "Hertie School, GRAD-E1340: Causal Inference and Machine Learning"
+title: "Causal Inference and Machine Learning"
 output: html_notebook
+
 ---
 
 # Final Project: 
@@ -822,4 +823,5 @@ Hlavac, Marek (2018). stargazer: Well-Formatted Regression and Summary Statistic
 Sanz, C. (2019). Direct democracy and government size: evidence from Spain. Political Science Research And Methods, 1-16. doi: 10.1017/psrm.2018.65
 
 Wing, C., Simon, K., & Bello-Gomez, R. (2018). Designing Difference in Difference Studies: Best Practices for Public Health Policy Research. Annual Review Of Public Health, 39(1), 453-469. doi: 10.1146/annurev-publhealth-040617-013507
+
 
